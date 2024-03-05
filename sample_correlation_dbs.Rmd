@@ -1,0 +1,458 @@
+---
+title: "Sample correlation plots"
+author: "Leo Dahl"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+    toc_float:
+      collapsed: false 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<style type="text/css">
+
+h1 { 
+  font-size: 25px;
+  margin-top: 1.5cm;
+  margin-bottom: 0.5cm;
+}
+h2 { 
+  font-size: 18px;
+  margin-top: 1cm;
+  margin-bottom: 0.5cm;
+}
+
+</style>
+
+Description
+===========
+
+> This script makes heatmaps showing protein-protein correlation
+
+```{r prep, message=F, results="hide"}
+
+rm(list=ls())
+options(stringsAsFactors = F)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(ggplotify)
+library(patchwork)
+library(cluster)
+library(ggplot2)
+library(stringr)
+library(heatmaply)
+library(dendextend)
+library(openxlsx)
+
+```
+
+***
+
+Load files
+==========
+
+```{r load data}
+
+source("load_cov_npx.R")
+
+cov_npx <- load_cov_npx("abspqn_adj")
+
+source("sep_datasets.R")
+
+```
+
+Loaded data set **`r cov_npx$data_set`**  
+from **`r cov_npx$data_path`**, with the following treatment:  
+`r cov_npx$norm`
+
+```{r}
+
+npx <- cov_npx$npx
+sinfo <- cov_npx$sinfo
+binder <- cov_npx$binder
+
+# Turn into character to not get unexpected behaviour from factor
+sinfo$grp <- as.character(sinfo$grp)
+
+# Merge duplicates/triplicates
+sep_dat <- sep_datasets(npx, sinfo)
+npx_umap <- sep_dat$npx_umap
+npx_spk <- sep_dat$npx_spk
+sinfo_umap <- sep_dat$sinfo_umap %>% mutate(serostatus = case_when(serostatus == "no reactivity" ~ "Seronegative, IgM-IgG-",
+                                                                   serostatus == "IgG + IgM" ~ "Seropositive, IgM+IgG+"))
+sinfo_spk <- sep_dat$sinfo_spk %>% mutate(serostatus = case_when(serostatus == "IgM" ~ "Early phase, IgM+IgG-",
+                                                                 serostatus == "IgG" ~ "Late phase, IgM-IgG+"))
+rm(sep_dat)
+
+```
+
+Also get dataset 3
+
+```{r}
+
+ds3 <- load_cov_npx(paste0("ds3_", cov_npx$data_set)) %>% merge_repl()
+
+sinfo_ds3 <- ds3$sinfo %>% rename(serostatus = grp) %>%
+  mutate(serostatus = case_when(serostatus == "Negative" ~ "Seronegative, IgG-",
+                                serostatus == "Positive" ~ "Seropositive, IgG+"))
+npx_ds3 <- ds3$npx %>% filter(sample_id %in% sinfo_ds3$sample_id)
+binder_ds3 <- ds3$binfo
+
+```
+
+Loaded data set from **`r ds3$data_path`**
+
+***
+
+Protein-protein correlation
+===========================
+
+Protein-protein correlation heatmaps are made for the two different data sets. Interactive heatmaps below, static pdf versions and tables are found in results/correlation_plots. 
+
+```{r clustering and heatmaps}
+# Clustering function
+cor_hclust <- function(x, k = NULL, clust_method = "ward.D") {
+  # Cluster with correlation distance
+  hcl <- as.dist(1 - x) %>%
+    hclust(method = clust_method) %>%
+    as.dendrogram() %>%
+    ladderize()
+  
+  # Output, append cluster memberships if k is given
+  out_list <- list()
+  
+  if (!is.null(k)) {
+    # Cluster memberships
+    cl <- cutree(hcl, k)
+    out_list$cluster <- cl
+  }
+  
+  out_list$dend <- hcl
+  
+  return(out_list)
+}
+
+# Optimal number of clusters according to gap statistic
+get_optimal_k <- function(x, k_max = 15, b = 50) {
+  gap_stat <- clusGap(x, FUNcluster = cor_hclust, K.max = k_max, B = b)
+    
+    # Get optimal k as smallest k where gap_k >= gap_k+1 - SE_k+1
+    gap_tab <- gap_stat$Tab %>%
+      as.data.frame() %>%
+      # Gap minus SE for next k
+      mutate(gms = lead(gap) - lead(SE.sim),
+             gap_larger = gap >= gms)
+    
+    optimal_k <- which(gap_tab$gap == (gap_tab %>% filter(gap_larger) %>% pull(gap) %>% min()))
+    
+    return(optimal_k)
+}
+
+# Hierarchical clustering, heatmaps and alluvial plots
+set.seed(12345)
+cor_serostatus <- rbind(
+  # Make long format data so that the datasets can be combined (do not necessarily contain the same proteins)
+  npx_umap %>% as.data.frame() %>% rownames_to_column("unique_participant_ID") %>% pivot_longer(cols = -unique_participant_ID, names_to = "assay", values_to = "npx"),
+  npx_spk %>% as.data.frame() %>% rownames_to_column("unique_participant_ID") %>% pivot_longer(cols = -unique_participant_ID, names_to = "assay", values_to = "npx"),
+  npx_ds3 %>% as.data.frame() %>% rename(unique_participant_ID = sample_id) %>% pivot_longer(cols = -unique_participant_ID, names_to = "assay", values_to = "npx")
+  ) %>%
+  # Add info on serostatus
+  left_join(
+    rbind(sinfo_umap %>% select(unique_participant_ID, serostatus),
+          sinfo_spk %>% select(unique_participant_ID, serostatus),
+          sinfo_ds3 %>% rename(unique_participant_ID = sample_id) %>% select(unique_participant_ID, serostatus)),
+    by = "unique_participant_ID"
+  ) %>%
+  mutate(serostatus = factor(serostatus, levels = c("Seronegative, IgM-IgG-",
+                                                    "Seropositive, IgM+IgG+",
+                                                    "Late phase, IgM-IgG+",
+                                                    "Early phase, IgM+IgG-",
+                                                    "Seropositive, IgG+",
+                                                    "Seronegative, IgG-"))) %>%
+  arrange(serostatus) %>%
+  # Perform analysis per serostatus
+  group_by(serostatus) %>%
+  nest() %>%
+  # Make wide format data per dataset
+  mutate(data = map(data, ~ {
+    pivot_wider(.x, id_cols = unique_participant_ID, names_from = "assay", values_from = "npx") %>%
+      column_to_rownames("unique_participant_ID")
+  })) %>%
+  # Correlation matrix
+  mutate(corr = map(data, cor, method = "spearman")) %>%
+  # Optimal number of clusters using gap statistic
+  mutate(optimal_k = map(corr, get_optimal_k, b = 50)) %>%
+  # Heatmaps
+  mutate(heatmap = map(corr, ~ {
+    hcl <- cor_hclust(.x, k = optimal_k)
+    clust <- hcl$dend
+    clust_order <- hcl$cluster[order.dendrogram(clust)] %>% unique()
+    
+    hm <- Heatmap(.x, col = colorRamp2(breaks = seq(from = -1, to = 1, length.out = 101),
+                                 colors = rev(colorRampPalette(brewer.pal(10, "RdBu"))(101))),
+                  cluster_columns = clust, cluster_rows = clust, show_column_names = F, show_row_names = F,
+                  name = "Rho", column_title = clust_order, column_split = as.numeric(optimal_k),
+                  row_split = as.numeric(optimal_k), row_title = clust_order)
+    # Add extra column title and grab expression to turn into ggplot for easier plot combining of plots
+    hm <- draw(hm, column_title = as.character(serostatus), column_title_gp = gpar(fontsize = 18, fontface = "bold")) %>%
+      grid.grabExpr() %>%
+      as.ggplot()
+  })) %>%
+  # Cluster memberships
+  mutate(mem = map(corr, ~ {cor_hclust(.x, k = optimal_k)$cluster})) %>%
+  ungroup() %>%
+  mutate(dataset = case_when(serostatus %in% c("Seronegative, IgM-IgG-", "Seropositive, IgM+IgG+") ~ "Dataset1",
+                             serostatus %in% c("Late phase, IgM-IgG+", "Early phase, IgM+IgG-") ~ "Dataset2",
+                             serostatus %in% c("Seropositive, IgG+", "Seronegative, IgG-") ~ "Dataset3")) %>%
+  group_by(dataset) %>%
+  nest() %>%
+  # Merged heatmap per dataset
+  mutate(heatmap_merge = map(data, ~ {
+    wrap_plots(list(
+      .x$heatmap[[1]] + labs(tag = switch(unique(dataset),
+                                          "Dataset1" = "A",
+                                          "Dataset2" = "B",
+                                          "Dataset3" = "C")) + theme(plot.tag = element_text(size = 24)),
+      .x$heatmap[[2]]
+    ))
+  })) %>%
+  # Alluvial plot per dataset
+  mutate(alv_plt = map(data, ~ {
+    aclust <- cor_hclust(.x$corr[[1]], .x$optimal_k[[1]])$cluster
+    bclust <- cor_hclust(.x$corr[[2]], .x$optimal_k[[2]])$cluster
+
+    # Combine using protein order from a
+    prots <- names(aclust)
+    alluv_in <- data.frame(
+      "protein" = prots,
+      "clust_a" = paste0(as.character(.x$serostatus[[1]]), ": ", aclust),
+      "clust_b" = paste0(as.character(.x$serostatus[[2]]), ": ", bclust[prots])
+    )
+
+    plt <- ggplot(alluv_in, aes(axis1 = clust_a, axis2 = clust_b)) +
+      geom_alluvium() +
+      geom_stratum() +
+      geom_text(stat = "stratum",
+                aes(label = after_stat(stratum))) +
+      labs(tag = switch(unique(dataset),
+                        "Dataset1" = "A",
+                        "Dataset2" = "B",
+                        "Dataset3" = "C")) +
+      theme_void(14) +
+      theme(plot.tag = element_text(size = 24))
+
+    return(plt)
+  }))
+
+clust_mean_cor <- lapply(as.data.frame(t(expand.grid(1:2, 1:3))), function(x) {
+    cor_mat <- cor_serostatus$data[[x[2]]]$corr[[x[1]]]
+    clust <- cor_serostatus$data[[x[2]]]$mem[[x[1]]]
+    clust_cor <- sapply(unique(clust), function(cl) {
+        clust_prot <- names(clust[clust == cl])
+        clust_cor <- cor_mat[clust_prot, clust_prot]
+        # Keep only upper matrix
+        clust_cor <- clust_cor[upper.tri(clust_cor, diag = F)]
+        # Mean of the correlations
+        mean(clust_cor)
+    })
+})
+names(clust_mean_cor) <- lapply(as.data.frame(t(expand.grid(1:2, 1:3))), function(x) {
+  cor_serostatus$data[[x[2]]]$serostatus[[x[1]]]
+}) %>% unlist()
+```
+
+
+```{r save plots}
+out_dir <- "../results/correlation_plots/"
+# Save heatmaps
+ggsave(filename = paste0(out_dir, format(Sys.time(), "%Y-%m-%d_%H%M%S"), "_heatmaps.pdf"),
+       height = 18, width = 12, plot = wrap_plots(cor_serostatus$heatmap_merge, nrow = 3))
+
+# Save alluvial plots
+ggsave(filename = paste0(out_dir, format(Sys.time(), "%Y-%m-%d_%H%M%S"), "_alluvial.pdf"),
+       height = 12, width = 8, plot = wrap_plots(cor_serostatus$alv_plt, nrow = 3))
+```
+
+```{r}
+jaccard_ind <- function(a, b) {
+  intersect_size <- length(intersect(a, b))
+  union_size <-length(union(a, b))
+  jacc_ind <- intersect_size / union_size
+  
+  return(jacc_ind)
+}
+
+
+mean_jaccard <- function(x, opt_k, mem, B = 50, samp_which = "both") {
+  # Mean Jaccard Indices for clusters using bootstrapping. Hierarchical clustering with correlation distance
+  # x, matrix to cluster
+  # opt_k, numeric of length one specifiying the optimal number of clusters
+  # mem, memberships from original clustering for which to compute mean jaccard indices
+  # B, number of resamplings
+  # samp_which, which to sample, "samples" or "proteins" or "both" (or any non-ambiguous starting substring)
+  
+  ji_vec <- sapply(1:B, function(iter) {
+    if (grepl(paste0("^", samp_which), "samples", ignore.case = T) |
+        grepl(paste0("^", samp_which), "both", ignore.case = T)) {
+      
+      # Get new samples, no need to remember which samples since the resulting protein-protein correlations will contain all proteins
+      new_samps <- sample(1:nrow(x), nrow(x), replace = T)
+      x <- x[new_samps, ]
+      
+    }
+    
+    if (grepl(paste0("^", samp_which), "proteins", ignore.case = T) |
+        grepl(paste0("^", samp_which), "both", ignore.case = T)) {
+      # Get a subset of proteins to cluster
+      new_prots <- sample(colnames(x), ncol(x), replace = T)
+      
+      x <- x[, new_prots]
+    }
+    
+    cor_mat <- cor(x, method = "spearman")
+    
+    # Cluster new correlation matrix
+    new_mem <- cor_hclust(cor_mat, k = opt_k)$cluster
+    
+    # Use only proteins included in the new clustering to compute the index
+    old_mem <- mem[unique(names(new_mem))]
+    
+    # Split names by cluster and compute Jaccard index between old and new clusters
+    new_clust <- split(names(new_mem), new_mem)
+    old_clust <- split(names(old_mem), old_mem)
+    
+    max_ji <- sapply(old_clust, function(a) {
+      ji <- sapply(new_clust, function(b) {
+        jaccard_ind(a, b)
+      })
+      
+      return(max(ji))
+    })
+    
+    return(max_ji)
+  }) %>% t()
+  
+  out_df <- data.frame("cluster" = 1:opt_k,
+                       "mean_ji" = colMeans(ji_vec),
+                       "sd_ji" = apply(ji_vec, 2, sd))
+  
+  return(out_df)
+}
+
+set.seed(123)
+mji <- lapply(as.data.frame(t(expand.grid(1:2, 1:3))), function(x) {
+    in_dat <- cor_serostatus$data[[x[2]]]
+    mean_jaccard(in_dat$data[[x[1]]],
+                 in_dat$optimal_k[[x[1]]],
+                 in_dat$mem[[x[1]]],
+                 B = 50, samp_which = "prot")
+})
+names(mji) <- lapply(as.data.frame(t(expand.grid(1:2, 1:3))), function(x) {
+  cor_serostatus$data[[x[2]]]$serostatus[[x[1]]]
+}) %>% unlist()
+```
+
+```{r}
+# Table of cluster assignments and mean jaccard indices
+n_clust <- max(sapply(mji, nrow))
+clust_tbl_in <- list(
+  # Cluster assignments
+  clust = data.frame("Binder" = colnames(cor_serostatus$data[[1]]$corr[[1]])) %>%
+    # Additional binder information
+    mutate(Gene_name = binder[match(Binder, binder$unique_id), "gene_name", drop = T],
+           Panel = binder[match(Binder, binder$unique_id), "panel_name", drop = T],
+           UniProt_ID = binder[match(Binder, binder$unique_id), "uniprot_ID", drop = T]),
+  ji = data.frame("Cluster" = 1:max(sapply(mji, nrow))),
+  mc = data.frame("Cluster" = 1:max(lengths(clust_mean_cor)))
+)
+
+for (grp in c("Seronegative, IgM-IgG-", "Seropositive, IgM+IgG+",
+              "Early phase, IgM+IgG-", "Late phase, IgM-IgG+",
+              "Seronegative, IgG-", "Seropositive, IgG+")) {
+  # Dataset for matching position in cor_serostatus list
+  ds <- case_when(grp %in% c("Seronegative, IgM-IgG-", "Seropositive, IgM+IgG+") ~ "Dataset1",
+                  grp %in% c("Early phase, IgM+IgG-", "Late phase, IgM-IgG+") ~ "Dataset2",
+                  grp %in% c("Seronegative, IgG-", "Seropositive, IgG+") ~ "Dataset3")
+  
+  # Add cluster memberships
+  clust_mem_elem <- cor_serostatus$data[cor_serostatus$dataset == ds][[1]]
+  clust_mem_ind <- str_which(clust_mem_elem$serostatus, regex(str_replace_all(grp, "\\+", "\\\\+"), ignore_case = T))
+  clust_tbl_in$clust[, paste0("Cluster_", grp)] <- clust_mem_elem$mem[[clust_mem_ind]][clust_tbl_in$clust$Binder]
+  
+  # Add mean Jaccard indices
+  mji_elem <- mji[[str_which(names(mji), regex(str_replace_all(grp, "\\+", "\\\\+"), ignore_case = T))]]
+  clust_tbl_in$ji[, paste0(c("MJI_", "SD_"), grp)] <- c(
+    c(mji_elem$mean_ji, rep(NA, n_clust - length(mji_elem$mean_ji))),
+    c(mji_elem$sd_ji, rep(NA, n_clust - length(mji_elem$sd_ji)))
+  )
+  
+  # Add mean cluster correlations
+  mc_elem <- clust_mean_cor[[str_which(names(clust_mean_cor), regex(str_replace_all(grp, "\\+", "\\\\+"), ignore_case = T))]]
+  clust_tbl_in$mc[, grp] <- c(mc_elem, rep(NA, n_clust - length(mc_elem)))
+}
+rm(clust_mem_elem, mji_elem, mc_elem)
+
+clust_tbl <- createWorkbook()
+addWorksheet(clust_tbl, "Cluster_assignments")
+writeDataTable(clust_tbl, "Cluster_assignments", as.data.frame(clust_tbl_in$clust))
+addWorksheet(clust_tbl, "Mean_Jaccard_Index")
+writeDataTable(clust_tbl, "Mean_Jaccard_Index", clust_tbl_in$ji)
+addWorksheet(clust_tbl, "Mean_Correlation_Rho")
+writeDataTable(clust_tbl, "Mean_Correlation_Rho", clust_tbl_in$mc)
+
+saveWorkbook(clust_tbl, paste0(out_dir, format(Sys.time(), "%Y-%m-%d_%H%M%S"), "_cluster_table.xlsx"))
+```
+
+```{r correlation table per serostatus}
+# Make tables of protein correlation for the different data sets and analysis groups, here including p-values for the correlations
+long_cor_mat <- function(x, respname = "rsp") {
+  # Make long correlation matrix, skipping diagonals
+  x[lower.tri(x, diag = T)] <- NA
+  as.data.frame.table(x, responseName = respname) %>% na.omit()
+}
+
+cor_tbls <- sapply(cor_serostatus$dataset, function(ds) {
+  # Get data for the dataset
+  cor_serostatus_ds <- cor_serostatus$data[cor_serostatus$dataset == ds][[1]]
+  
+  # Go through serostatuses in the data
+  sapply(as.character(cor_serostatus_ds$serostatus), function(ser) {
+    d <- cor_serostatus_ds[cor_serostatus_ds$serostatus == ser, "data"][[1]][[1]]
+    cor_test <- corr.test(d, method = "spearman", ci = F, adjust = "none")
+    cor_mat <- long_cor_mat(cor_test$r, "Correlation")
+    cor_p <- long_cor_mat(cor_test$p, "Pvalue")
+    
+    tbl_out <- cor_mat %>% left_join(cor_p, by = c("Var1", "Var2")) %>%
+      mutate(FDR = p.adjust(Pvalue, method = "fdr")) %>%
+      rename(Binder1 = Var1, Binder2 = Var2) %>%
+      # Remove panel names from columns
+      mutate(Binder1 = binder[match(Binder1, binder$unique_id), "assay", drop = T],
+             Binder2 = binder[match(Binder2, binder$unique_id), "assay", drop = T])
+    
+  }, simplify = F)
+  
+}, simplify = F) %>%
+  # Remove highest level (dataset) in list to get one element per serostatus
+  unlist(recursive = F)
+
+# Save tables
+write.xlsx(cor_tbls, paste0( "../results/correlation_plots/", format(Sys.time(),"%Y-%m-%d_%H%M%S"), "_prot_cor_table.xlsx"))
+
+```
+
+
+***
+
+Session information
+===================
+
+```{r session information}
+sessionInfo()
+```

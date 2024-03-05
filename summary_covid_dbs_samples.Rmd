@@ -1,0 +1,303 @@
+---
+title: "Covid19 DBS Olink sample summary"
+author: "Creator: Tea Dodig-Crnkovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+    toc_float:
+      collapsed: false 
+
+---
+<!-- highlight: textmate -->
+
+<!-- Edit TOC style (background color) -->
+<style>
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    background-color: #EAEAEA;
+    color: black;}
+</style>
+
+<!-- Set background color for highlighted text -->
+<style>
+div.highlight { 
+  background-color: #EAEAEA;  <!-- #39AC91 (turquoise) -->
+  color: #FFFFEF;
+  padding: 10px;
+  border-radius: 2px 2px 2px 2px;}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy=FALSE)
+```
+
+
+<style type="text/css">
+
+h1.title {
+  font-size: 22px;
+}
+h1 { /* Header 1 */
+  font-size: 18px;
+}
+h2 { /* Header 2 */
+    font-size: 15px;
+}
+h3 { /* Header 3 */
+  font-size: 12px;
+}
+
+</style>
+
+***
+# Description
+
+<div class = "highlight">
+Summary of samples included in Covid19 DBS Olink panels CVD3, MET and CAM.   
+
+* Frequency table, demographics and meta data   
+  
+ 
+</div>
+***
+
+# Initialization
+```{r initialization, eval=T, warning=F}
+# empty global environment
+rm(list = ls(all.names = TRUE))
+```
+
+# Load packages
+```{r packages, eval=T, warning=F, message=FALSE}
+# load packages
+library(tidyverse)
+library(DT)
+library(table1)
+```
+
+***
+# Load files
+```{r pathways, eval=t}
+source("load_cov_npx.R")
+cov_npx <- load_cov_npx("abspqn_excl")
+data_set <- cov_npx$data_set
+data_file_path <- cov_npx$data_path
+```
+
+Loaded data set **`r cov_npx$data_set`**  
+from **`r cov_npx$data_path`**, with the following treatment:  
+`r cov_npx$norm`
+
+***
+
+# Select data
+```{r data_selection, eval=t}
+
+# select input data
+dat <- cov_npx
+
+sinfo  <- as.data.frame(dat$sinfo)
+binder <- as.data.frame(dat$binder)
+npx <- as.matrix(dat$npx)
+norm_info <- cov_npx$norm
+
+# select samples and binders to include
+selected_samples <- sinfo$sample_id
+selected_binders <- binder$unique_id
+
+samp_info <- paste0("Samples n=", dim(npx[selected_samples, selected_binders])[1])
+binder_info <- paste0("Binders n=", dim(npx[selected_samples, selected_binders])[2])
+
+```
+
+```{r}
+ds3 <- load_cov_npx(paste0("ds3_", cov_npx$data_set))
+sinfo_ds3 <- ds3$sinfo %>% rename(Analysis_group = grp) 
+npx_ds3 <- ds3$npx
+sinfo_ds3 <- sinfo_ds3 %>% filter(sample_id %in% npx_ds3$sample_id)
+binder_ds3 <- ds3$binfo
+```
+
+***
+**Data options**
+
+*Data set*:   
+`r cov_npx$data_set`
+
+*Data set input file*:   
+`r cov_npx$data_path`
+
+*Data set notes*:   
+`r norm_info`
+
+*Number of samples included:*   
+`r samp_info`
+
+*Number of binders included:*   
+`r binder_info`
+
+***
+# Frequency tables (demographics)
+```{r fig.align='center', warning=F}
+
+# only inlcude unique population participant samples (remove duplicates)
+dat <- sinfo %>% 
+	filter(grp == "Population" | grp == "Bridge") %>% 
+	filter(!c(grp == "Bridge" & Analysis_date == "2020-11-13")) %>% # only keep bridge info from first Olink run
+  select(Sex,
+         Age_grp,
+         Symptom,
+         Breath,
+         Positive,
+         serostatus,
+         unique_participant_ID,
+         umap_seropositive_IgG_IgM,
+         Analysis_date,
+         Population_batch,
+  			 Analysis_group) %>% 
+  distinct() %>%
+  mutate(serostatus = case_when(serostatus == "no reactivity" ~ "Seronegative, IgM-IgG-",
+                                serostatus == "IgG + IgM" ~ "Seropositive, IgM+IgG+",
+                                serostatus == "IgM" ~ "Early phase, IgM+IgG-",
+                                serostatus == "IgG" ~ "Late phase, IgM-IgG+"))
+	
+# dat$p_val <- NA
+
+dat$Analysis_group <- factor(dat$Analysis_group)
+
+dat <- 
+	dat %>% as_tibble()
+
+
+label(dat$Sex) <- "Sex"
+label(dat$Age_grp) <- "Age group"
+label(dat$Symptom) <- "Symptom"
+label(dat$Breath) <- "Breath"
+label(dat$Positive) <- "Positive"
+label(dat$serostatus) <- "Seropositivity group"
+label(dat$umap_seropositive_IgG_IgM) <- "UMAP seropositive"
+label(dat$Analysis_date) <- "Analysis date in lab"
+label(dat$Population_batch) <- "Population batch"
+label(dat$Analysis_group) <- "Analysis group"
+# label(dat$p_val) <- "P value"
+
+rndr <- function(x, name, ...) {
+  if (length(x) == 0) {
+    y <- tg[[name]]
+    s <- rep("", length(render.default(x=y, name=name, ...)))
+    p <- fisher.test(table(y, droplevels(tg$serostatus), useNA = "no"))$p.value
+    
+    s[2] <- sub("<", "&lt;", format.pval(p, digits=3, eps=0.001))
+    s
+  } else {
+    render.default(x=x, name=name, ...)
+  }
+}
+rndr.strat <- function(label, n, ...) {
+    ifelse(n==0, label, render.strat.default(label, n, ...))
+}
+```
+
+
+## UMAP group
+```{r fig.align='center', warning=F}
+
+# UMAP analysis group
+tg <- dat %>% 
+	filter(Analysis_group == "UMAP_1" | Analysis_group == "UMAP_0") %>%
+  mutate(serostatus = factor(serostatus, levels = c(sort(unique(.$serostatus)), "P-value")))
+
+table1(~ Sex + 
+			 	 Age_grp +
+         Symptom +
+         Breath +
+         Population_batch | serostatus, data=tg,
+       droplevels=F, render= rndr, render.strat=rndr.strat, overall=F)
+
+```
+
+## SPK group
+```{r fig.align='center', warning=F}
+
+# SPK analysis group
+tg <- dat %>%
+  filter(str_detect(Analysis_group, "SPK")) %>%
+  mutate(serostatus = factor(serostatus, levels = c(sort(unique(.$serostatus)), "P-value")))
+
+table1(~ Sex + 
+			 	 Age_grp +
+         Symptom +
+         Breath +
+         Population_batch | serostatus, data=tg,
+       droplevels=F, render= rndr, render.strat=rndr.strat, overall=F)
+
+```
+
+## Dataset 3
+
+```{r}
+# Make table for the table1 table
+tg <- sinfo_ds3 %>%
+  filter(!str_detect(sample_id, "_[:alpha:]")) %>%
+  select(sex, age_group, symptoms, Analysis_group) %>%
+  mutate(Analysis_group = case_when(Analysis_group == "Negative" ~ "Seronegative, IgG-",
+                                    Analysis_group == "Positive" ~ "Seropositive, IgG+")) %>%
+  mutate(Analysis_group = factor(Analysis_group, levels = c(
+    sort(unique(as.character(Analysis_group))), "P-value"
+  ))) %>%
+  rename(serostatus = Analysis_group)
+
+label(tg$sex) <- "Sex"
+label(tg$age_group) <- "Age group"
+label(tg$symptoms) <- "Symptoms"
+
+table1(~ sex + age_group + symptoms | serostatus, data = tg,
+       droplevels = F, render = rndr, render.strat = rndr.strat, overall = F)
+```
+
+
+## UMAP vs SPK group
+```{r fig.align='center', warning=F}
+
+# UMAP vs SPK analysis group
+tg <- dat %>% 
+	mutate(Analysis_date = factor(Analysis_date, levels = c("2020-06-23", "2020-11-13","P-value")))
+
+
+rndr <- function(x, name, ...) {
+  if (length(x) == 0) {
+    y <- tg[[name]]
+    s <- rep("", length(render.default(x=y, name=name, ...)))
+    p <- fisher.test(table(y, droplevels(tg$Analysis_date), useNA = "no"))$p.value
+    
+    s[2] <- sub("<", "&lt;", format.pval(p, digits=3, eps=0.001))
+    s
+  } else {
+    render.default(x=x, name=name, ...)
+  }
+}
+rndr.strat <- function(label, n, ...) {
+    ifelse(n==0, label, render.strat.default(label, n, ...))
+}
+
+
+table1(~ Sex + 
+			 	 Age_grp +
+         Symptom +
+         Breath +
+			 	 Analysis_group +
+			 	 serostatus +
+         Population_batch | Analysis_date, data=tg,
+       droplevels=F, render= rndr, render.strat=rndr.strat, overall=F,
+			 footnote = "All population participants with their single sample included here")
+
+```
+***
+
+
+# Session information
+```{r session_info, eval=T, echo=F}
+sessionInfo()
+```
+

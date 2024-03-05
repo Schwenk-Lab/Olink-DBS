@@ -1,0 +1,273 @@
+---
+title: "Lasso regression"
+author: "Leo Dahl"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+    toc_float:
+      collapsed: false 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<style type="text/css">
+
+h1 { 
+  font-size: 25px;
+  margin-top: 1.5cm;
+  margin-bottom: 0.5cm;
+}
+h2 { 
+  font-size: 18px;
+  margin-top: 1cm;
+  margin-bottom: 0.5cm;
+}
+
+</style>
+
+Description
+===========
+
+> This script performs Lasso regression to select features based on the "serostatus" variable in each data set
+
+```{r prep, message=F, results="hide"}
+
+rm(list=ls())
+options(stringsAsFactors = F)
+library(tidyverse)
+library(stringr)
+library(glmnet)
+library(gplots)
+library(patchwork)
+
+```
+
+***
+
+Data preparation
+================
+
+Load files
+----------
+
+```{r load data}
+
+source("load_cov_npx.R")
+
+cov_npx <- load_cov_npx("abspqn_adj")
+
+source("sep_datasets.R")
+out_dir <- "../results/lasso_regression/"
+```
+
+Loaded data set **`r cov_npx$data_set`**  
+from **`r cov_npx$data_path`**, with the following treatment:  
+`r cov_npx$norm`
+
+
+```{r}
+
+npx <- cov_npx$npx
+sinfo <- cov_npx$sinfo
+binder <- cov_npx$binder
+
+# Turn into character to not get unexpected behaviour from factor
+sinfo$grp <- as.character(sinfo$grp)
+
+# Merge duplicates/triplicates
+sep_dat <- sep_datasets(npx, sinfo)
+npx_umap <- sep_dat$npx_umap
+npx_spk <- sep_dat$npx_spk
+sinfo_umap <- sep_dat$sinfo_umap %>% mutate(serostatus = case_when(serostatus == "no reactivity" ~ "Seronegative, IgM-IgG-",
+                                                                   serostatus == "IgG + IgM" ~ "Seropositive, IgM+IgG+"))
+sinfo_spk <- sep_dat$sinfo_spk %>% mutate(serostatus = case_when(serostatus == "IgM" ~ "Early phase, IgM+IgG-",
+                                                                 serostatus == "IgG" ~ "Late phase, IgM-IgG+"))
+rm(sep_dat)
+
+```
+
+Also get studyset 3
+
+```{r}
+
+ds3 <- load_cov_npx(paste0("ds3_", cov_npx$data_set)) %>% merge_repl()
+
+sinfo_ds3 <- ds3$sinfo %>% rename(serostatus = grp) %>%
+  mutate(serostatus = case_when(serostatus == "Negative" ~ "Seronegative, IgG-",
+                                serostatus == "Positive" ~ "Seropositive, IgG+"))
+npx_ds3 <- ds3$npx %>% filter(sample_id %in% sinfo_ds3$sample_id)
+binder_ds3 <- ds3$binfo
+
+```
+
+Loaded data set from **`r ds3$data_path`**
+
+Lasso regression
+================
+
+For each data set (Data set 1, UMAP and Data set 2, SPK), Lasso is performed using the "serostatus" variable (UMAP0/UMAP1, IgG/IgM) as binary outcome. After the regression some features have a zero coefficient, the remaining features are the ones that are selected as informative for the variable. Since results have a random component, the analysis is performed ten times for each data set and the intersection of non-empty repetitions is presented. The number of non-empty runs where the proteins appear is also shown, more robust results will be closer to 10.
+
+```{r}
+# Scale and center data before analysis
+dat <- list("studyset1" = list("npx" = as.data.frame(scale(npx_umap)),
+                              "sinfo" = sinfo_umap,
+                              "name" = "studyset1"),
+            "studyset2" = list("npx" = as.data.frame(scale(npx_spk)),
+                              "sinfo" = sinfo_spk,
+                              "name" = "studyset2"),
+            "studyset3" = list("npx" = npx_ds3 %>% column_to_rownames("sample_id") %>% scale() %>% as.data.frame(),
+                              "sinfo" = sinfo_ds3[match(npx_ds3$sample_id, sinfo_ds3$sample_id), ] %>% remove_rownames() %>% `rownames<-`(.$sample_id),
+                                "name" = "studyset3"))
+
+lasso_results <- sapply(dat, function(d) {
+  
+  set.seed(12345)
+  
+  lasso_repl <- sapply(1:10, function(iter) {
+  # Prepare outcome variable so it only contains two levels
+  d$sinfo$serostatus <- factor(d$sinfo$serostatus,
+                                   levels = as.character(unique(d$sinfo$serostatus)))
+  
+  # Add age and sex into the input features if not using adjusted data
+  if (str_detect(cov_npx$data_set, "adj", negate = T)) {
+    d$npx$age <- d$sinfo[rownames(d$npx), str_subset(colnames(d$sinfo), "(?i)^age_"), drop = T]
+    d$npx$sex <- d$sinfo[rownames(d$npx), str_subset(colnames(d$sinfo), "(?i)^sex"), drop = T]
+  }
+  # Make model matrix for input
+  mm <- model.matrix(~ ., d$npx)[, -1]
+  
+  lasso_fit <- cv.glmnet(x = mm,
+                         y = d$sinfo[rownames(mm), "serostatus", drop = T],
+                         family = "binomial",
+                         type.measure = "default",
+                         alpha = 1) # alpha = 1 for lasso regression
+  
+  # Feature importance as the absolute values of the coefficients, as in the varImp function of the caret package
+  feat_imp <- coef(lasso_fit, s = "lambda.min")[, 1]
+  
+  return(feat_imp[feat_imp != 0 & names(feat_imp) != "(Intercept)"])
+  }, simplify = F)
+  
+  # Remove iterations with no remaining features to get intersection of iterations with features
+  lasso_repl <- lasso_repl[lengths(lasso_repl) > 0]
+  
+  feat_overlap <- lapply(lasso_repl, names) %>% Reduce(intersect, .)
+  
+  # Mean feature importance (absolute value of coefficient) for the overlapping features
+  if (length(feat_overlap) > 0) {
+    # Go through features to compute mean
+    feat_imp <- sapply(feat_overlap, function(ft) {
+      mean(sapply(lasso_repl, function(x) abs(x[[ft]])))
+    }) %>% sort(decreasing = T)
+  } else {
+    feat_imp <- NULL
+  }
+  
+  return(list("overlapping_features" = feat_overlap, "feature_importance" = feat_imp, "replications" = lasso_repl))
+}, simplify = F, USE.NAMES = T)
+
+# Display some results
+lapply(lasso_results, function(x) {
+  list(
+    "features" = x$overlapping_features,
+    "importance" = x$feature_importance,
+    "non-empty replications" = length(x$replications)
+  )
+})
+
+```
+
+Visualising differences
+=======================
+
+Boxplots
+--------
+
+```{r}
+
+boxplts <- lapply(dat, function(x) {
+  # Exit if no features
+  if (length(str_subset(lasso_results[[x$name]]$overlapping_features, "age|sex", negate = T)) == 0) return(NULL)
+  
+  # Order proteins by importance
+  prot_ord <- binder[match(names(sort(lasso_results[[x$name]]$feature_importance, decreasing = T)), binder$unique_id), "gene_name", drop = T]
+  
+  # Add analysis group to data frame and turn into longer format
+  bpdf <- x$npx %>%
+    as.data.frame() %>%
+    select(!!str_subset(lasso_results[[x$name]]$overlapping_features, "age|sex", negate = T)) %>%
+    mutate(serostatus = x$sinfo[rownames(x$npx), "serostatus"]) %>%
+    pivot_longer(cols = -serostatus,
+                 names_to = "Binder", values_to = "NPX") %>%
+    mutate(Binder = binder[match(Binder, binder$unique_id), "gene_name", drop = T]) %>%
+    # Turn into factor to keep order
+    mutate(Binder = factor(Binder, levels = prot_ord))
+  
+  dat_col <- RColorBrewer::brewer.pal(6, "Set2")
+  dat_col <- switch(x$name, "studyset1" = dat_col[1:2], "studyset2" = dat_col[3:4], "studyset3" = dat_col[5:6]) %>%
+    setNames(unique(bpdf$serostatus))
+  
+  bplt <- ggplot(bpdf, aes(x = Binder, y = NPX, fill = serostatus)) +
+    geom_boxplot(size = 1) +
+    scale_fill_manual(values = dat_col) +
+    labs(x = NULL, y = "Z-score", fill = "Serostatus", title = x$name) +
+    ylim(-5, 5) +
+    theme_classic() +
+    theme(axis.line = element_line(size = 1),
+          axis.text = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          legend.title = element_text(size = 16),
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          plot.title = element_text(hjust = 0.5))
+  
+})
+boxplts <- boxplts[!sapply(boxplts, is.null)]
+wrap_plots(boxplts, nrow = length(boxplts))
+
+```
+
+Save plots
+
+```{r}
+ggsave(paste0(out_dir, format(Sys.time(), "%Y-%m-%d_%H%M%S"), "_lasso_box.pdf"),
+       height = 8, width = 12)
+```
+
+Save protein values
+
+```{r}
+prot_values <- lapply(names(dat), function(x) {
+  dat[[x]]$npx %>% scale(center = T, scale = T) %>%
+    as.data.frame() %>%
+    rownames_to_column("sample_id") %>%
+    left_join(dat[[x]]$sinfo %>% select(sample_id, serostatus), by = "sample_id") %>%
+    pivot_longer(cols = -c(sample_id, serostatus), names_to = "protein", values_to = "npx") %>%
+    filter(protein %in% lasso_results[[x]]$overlapping_features) %>%
+    # Add importance
+    mutate(importance = lasso_results[[x]]$feature_importance[protein]) %>%
+    mutate(studyset = x)
+}) %>%
+  data.table::rbindlist() %>%
+  # Add some extra protein information
+  left_join(binder %>% select(unique_id, gene_name, uniprot_ID), by = c("protein" = "unique_id")) %>%
+  select(gene_name, uniprot_ID, studyset, serostatus, value = npx, importance) %>%
+  arrange(studyset, desc(importance), desc(value))
+```
+
+```{r}
+openxlsx::write.xlsx(prot_values, paste0(out_dir, format(Sys.time(), "%Y-%m-%d_%H%M%S"), "_protein_values.xlsx"), asTable = T)
+```
+
+
+Session information
+===================
+
+```{r}
+sessionInfo()
+```
+

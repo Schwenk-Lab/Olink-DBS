@@ -1,0 +1,792 @@
+---
+title: "Covid19 DBS Olink analysis"
+author: "Creator: Tea Dodig-Crnkovic. Contributors: Leo Dahl, Tea Dodig-Crnkovic"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+    toc_float:
+      collapsed: false 
+
+---
+<!-- highlight: textmate -->
+
+<!-- Edit TOC style (background color) -->
+<style>
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    background-color: #EAEAEA;
+    color: black;}
+</style>
+
+<!-- Set background color for highlighted text -->
+<style>
+div.highlight { 
+  background-color: #EAEAEA;  <!-- #39AC91 (turquoise) -->
+  color: #FFFFEF;
+  padding: 10px;
+  border-radius: 2px 2px 2px 2px;}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy=FALSE)
+```
+
+
+<style type="text/css">
+
+h1.title {
+  font-size: 22px;
+}
+h1 { /* Header 1 */
+  font-size: 18px;
+}
+h2 { /* Header 2 */
+    font-size: 15px;
+}
+h3 { /* Header 3 */
+  font-size: 12px;
+}
+
+</style>
+
+***
+# Description
+
+<div class = "highlight">
+Covid19 DBS Olink panels CVD3, MET, CAM.   
+Here, the sample is from an individual that has donated blood over time --> longitudinal analysis.
+  
+ 
+</div>
+
+***
+# Initialization
+```{r initialization, eval=T, warning=F}
+# empty global environment
+rm(list = ls(all.names = TRUE))
+```
+
+# Load packages
+```{r packages, eval=T, warning=F, message=FALSE}
+# load packages
+library(tidyverse)
+library(DT)
+library(gridExtra)
+library(reshape2) #melt()
+library(clValid) #SOTA
+library(writexl)
+library(xlsx)
+library(ggrepel)
+library(patchwork)
+```
+
+***
+# Load files
+```{r pathways, eval=t}
+
+source("load_cov_npx.R")
+cov_npx <- load_cov_npx("abspqn_adj")
+
+# information on longitudinal sampling dates
+metadata <- read.delim("longitudinal/covid19_longitudinal.txt", stringsAsFactors = F)
+
+# uniprot ids
+uni_id <- read.xlsx2(file="../results/uniprot_to_ensg/uniprot_IDs.xlsx",
+                    sheetIndex = 4)
+
+# get the values from the serological assays
+# Skip entry of sample form a different person
+ag_dat <- metadata[-which(metadata$id == "other_person"), ]
+rownames(ag_dat) <- ag_dat$id
+
+```
+
+Merge measurements from columns measuring the same antigen
+
+```{r}
+# MFI values of antigens of interest to use for analysis
+ag_mfi <- ag_dat %>% 
+  select(which(str_detect(colnames(.), "SPK|RBD|NCP"))) 
+
+# The antigen data is of the character class and contains commas, remove those
+ag_mfi <- apply(ag_mfi, 2, function(x) {
+  new_mfi <- gsub(",", "", x) 
+  class(new_mfi) <- "numeric"
+  return(new_mfi)
+}) %>% as.data.frame()
+
+# Take means of antigens of same type (e.g. SPK_01, SPK_02, ...), keep as list to keep names
+ag_mfi_mean_list <- apply(ag_mfi, 1, function(x) {
+  
+  # Go through the three antigens 
+  ag <- lapply(c("SPK"="SPK", "RBD"="RBD", "NCP"="NCP"), function(y) {
+    
+    # Go through IgG and IgM
+    ig <- lapply(c("IGG"="IGG", "IGM"="IGM"), function(z) {
+      
+      mean_out <- mean(x[which(str_detect(names(x), 
+                                          paste0("^", y, ".*", z, "$")))])
+      
+    }) %>% as.data.frame()
+    
+  }) %>% as.data.frame()
+  
+})
+ag_mfi_mean <- bind_rows(ag_mfi_mean_list)
+rownames(ag_mfi_mean) <- make.names(names(ag_mfi_mean_list))
+
+# Change names and make "duplicates" (with the same values) to incorporate into protein data
+ag_mfi_mean <- rbind(
+  ag_mfi_mean %>% `rownames<-`(paste0(rownames(ag_mfi_mean), "_A")),
+  ag_mfi_mean %>% `rownames<-`(paste0(rownames(ag_mfi_mean), "_B"))
+)
+
+```
+
+
+***
+# Set input data
+```{r data_selection, eval=t, results='hide'}
+
+dat <- as.matrix(cov_npx$longitudinal$npx)
+pat <- as.data.frame(cov_npx$longitudinal$sinfo)
+prot <- as.data.frame(cov_npx$binder)
+norm_info <- cov_npx$norm
+rownames(pat) <- pat$sample_id
+rownames(prot) <- prot$unique_id
+
+# only read in longitudinal data
+
+samples_to_include <- "Longitudinal sampling"
+binders_to_include <- paste0("All binders included")
+
+pat <- pat[match(rownames(dat),rownames(pat)),]
+dim(dat); dim(pat)
+
+# Include serology data
+dat <- dat %>% as.data.frame() %>% rownames_to_column("samp") %>%
+  left_join(ag_mfi_mean %>% rownames_to_column("samp"), by = "samp") %>%
+  column_to_rownames("samp") %>% as.matrix()
+
+prot_ags <- prot[1:6, ]
+ags <- colnames(ag_mfi_mean)
+rownames(prot_ags) <- ags
+prot_ags[, c("assay", "id", "unique_id", "gene_name")] <- c(ags, ags, ags, ags)
+prot <- rbind(prot, prot_ags)
+
+```
+
+
+***
+# Configure output options
+```{r output_options, eval=t}
+
+# set output directory
+out_dir <- "../results/longitudinal/"
+
+# select samples and binders to include
+selected_samples <- rownames(dat)
+selected_binders <- colnames(dat)
+
+samp_info <- paste0("Samples n=", dim(dat[selected_samples, selected_binders])[1])
+binder_info <- paste0("Binders n=", dim(dat[selected_samples, selected_binders])[2])
+
+```
+
+***
+**Data options**
+
+*Data set*:   
+`r cov_npx$data_set`
+
+*Data set input file*:   
+`r cov_npx$data_path`
+
+*Data set notes*:   
+`r norm_info`
+
+*Samples included in analysis:*   
+`r samples_to_include`
+
+*Number of samples included:*   
+`r samp_info`
+
+*Binders included in analysis:*   
+`r binders_to_include`
+
+*Number of binders included:*   
+`r binder_info`
+
+***
+# Add metadata
+```{r eval=t, results='hide'}
+metadata$unique_participant_ID <- make.names(metadata$id)
+
+pat <- 
+  metadata %>% 
+  select(unique_participant_ID,
+         Comment) %>% 
+  rename("days_since_symptoms_onset"= "Comment") %>%  #"Comment" = days since onset of symptoms
+  right_join(pat, by="unique_participant_ID") %>% 
+  select(subj.id:sample_id, unique_participant_ID, days_since_symptoms_onset) %>% 
+ mutate(rep = strsplit(sample_id, "_") %>% 
+           lapply(`[[`, 2) %>% 
+           unlist())
+```
+
+
+***
+# Correlation between replicate binders
+## Plot correlation
+<details><summary>Click to show plots</summary>
+```{r fig.align='center', warning=F}
+
+# Get samples available in duplicates
+dupl_samp <- pat %>% filter(unique_participant_ID %in% (pat %>% filter(duplicated(unique_participant_ID)) %>% pull(unique_participant_ID))) %>%
+  pull(sample_id)
+
+# put in donation order
+dat_order <- dat[sort(dupl_samp), ]
+
+par(mfrow=c(2,3), pty="s")
+
+for(binder in sort(selected_binders)){
+
+  x_min <- min(dat_order[grep("_A", rownames(dat_order)), binder],
+    dat_order[grep("_B", rownames(dat_order)), binder], na.rm = T)
+  x_max <- max(dat_order[grep("_A", rownames(dat_order)), binder],
+    dat_order[grep("_B", rownames(dat_order)), binder], na.rm=T)
+  
+  plot(dat_order[grep("_A", rownames(dat_order)), binder],
+    dat_order[grep("_B", rownames(dat_order)), binder],
+    xlab="Rep A", ylab="Rep B", main=binder,
+    xlim=c(x_min, x_max),
+    ylim=c(x_min, x_max), pch=19)
+  abline(0,1, col="blue")
+  
+  mtext(paste0("Rho = ", cor(dat_order[grep("_A", rownames(dat_order)), binder],
+    dat_order[grep("_B", rownames(dat_order)), binder],
+    method = "spearman") %>% round(2)), cex=0.7)
+    
+}
+
+
+```
+</details>
+
+
+## Calculate correlation
+Calculate correlation between binders, select proteins for downstream analysis.
+```{r fig.align='center', warning=F}
+
+z_score_all <-
+  dat %>%
+  scale() %>% 
+  data.frame()
+
+# put in donation order
+z_score_dupl <- z_score_all[sort(dupl_samp), ]
+
+for(binder in selected_binders){
+
+  prot$rep_cor[prot$unique_id %in% binder] <-
+    cor(z_score_dupl[grep("_A", rownames(z_score_dupl)), binder],
+    z_score_dupl[grep("_B", rownames(z_score_dupl)), binder],
+    method = "spearman") %>% round(2)
+}
+
+rho_cut_off <- "no cut-off" #0.75
+selected_cor_binders <- selected_binders #prot$unique_id[which(prot$rep_cor >= 0.75)]
+n_selected_cor_binders <- selected_cor_binders %>% length()
+
+```
+**Selected binders at Rho cut-off:**
+`r rho_cut_off`
+
+**N binders after cut-off:**
+`r n_selected_cor_binders`
+
+
+***
+## Caluclate average z-score between replicates
+Calculate average z-score per protein, for proteins above cut-off.
+```{r fig.align='center', warning=F}
+
+select_samps <- substr(rownames(z_score_all), 1, 12) %>% unique()
+
+z_score_mean <- data.frame(matrix(nrow = length(select_samps),
+                                  ncol = length(selected_binders)))
+
+colnames(z_score_mean) <- selected_binders 
+rownames(z_score_mean) <- select_samps
+
+for (samp in select_samps) {
+  z_score_mean[samp, ] <- apply(z_score_all[paste0(samp, c("_A", "_B")), ], 2, mean, na.rm=T)
+}
+
+
+# melt data (both replicates + mean)
+df <- rbind(z_score_all, z_score_mean)
+
+df <-
+  df %>% 
+  as_tibble() %>% 
+  transform("unique_participant_ID" = substr(rownames(df), 1, 12),
+            "sample_id" = rownames(df),
+            "replicate" = substr(rownames(df), 14, 14))
+
+levels(df$replicate) <- c("mean_A_B", "A", "B")
+
+df$days_since_symptoms_onset <- pat$days_since_symptoms_onset[match(df$unique_participant_ID, pat$unique_participant_ID)]
+  
+df_melt <-
+  df %>% 
+  melt(c("sample_id", "unique_participant_ID", "days_since_symptoms_onset", "replicate")) %>%
+  mutate(replicate = case_when(replicate == "" ~ "mean_A_B", T ~ replicate))
+
+
+```
+
+
+***
+# Longitudinal plots
+Plots per protein for longitudinal data.
+Inlcude both replicates and average value.
+```{r  eval=t, results='hide', message=FALSE, warning=F}
+
+plot_list <- list()
+
+for(binder in prot$unique_id[order(prot$rep_cor, decreasing = T)]) { #sort by correlation
+  #binder <- selected_binders[1]
+
+    plot_list[[binder]] <-
+      df_melt %>%
+  filter(variable == binder) %>%
+  ggplot((aes(x = days_since_symptoms_onset,
+              y = value,
+              group = replicate,
+              color = replicate))) +
+  theme_light() +
+  geom_point() +
+  geom_line(aes(linetype=replicate)) +
+  labs(title = paste0(binder, ", Rho = ", prot$rep_cor[prot$unique_id %in% binder]),
+       subtitle = paste0(norm_info, ", ", cov_npx$data_set,
+                         "\n", samples_to_include, ", ", binders_to_include),
+       tag=format(Sys.time(),"%Y-%m-%d"),
+       caption="")
+
+}
+
+spl <- split(plot_list, (seq_along(plot_list)-1) %/% 12)
+
+ppl <- lapply(spl, function(g)
+	marrangeGrob(grobs = g, layout_matrix = matrix(1:12, ncol=3, byrow=T), top=NULL))
+
+
+pdf(paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+					 "_longitudinal_lineplots.pdf"),
+		width = 14, height = 12, useDingbats=F, onefile=T)
+
+print(ppl)
+
+dev.off()
+
+```
+
+***
+### Example plots
+All plots can be found in output folder.
+```{r fig.align='center', warning=F, fig.dim = c(14,12)}
+
+print(ppl[1])
+
+```
+
+
+***
+### Selected targets
+Plot selected increasing and decrasing protein profiles.
+```{r fig.align='center', warning=F, fig.dim = c(14,12)}
+# red = decreasing, blue = increasing
+red_tar <- c("ANGPTL7.MET", "IL.18BP.CVD3", "IL2.RA.CVD3") #"MBL2.CAM",  "NPDC1.MET"
+blue_tar <- c("CHRDL2.MET", "CRTAC1.CAM", "Gal.3.CVD3") #"NADK.MET", "LYVE1.CAM"
+
+df_melt$subgroup <- NA
+
+df_melt$subgroup[df_melt$variable %in% c(red_tar)] <- "decreasing"
+df_melt$subgroup[df_melt$variable %in% c(blue_tar)] <- "increasing"
+
+# add gene names
+df_melt <- 
+  prot[, c("gene_name", "unique_id")] %>% 
+  rename("variable"="unique_id") %>% 
+  left_join(df_melt, by="variable")
+
+
+pdf(paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+					 "_longitudinal_selected_lineplots.pdf"),
+		width = 8, height = 5, useDingbats=F, onefile=T)
+
+df_melt[df_melt$variable %in% c(red_tar, blue_tar),] %>% 
+  filter(replicate == "mean_A_B") %>% 
+  ggplot((aes(x = days_since_symptoms_onset,
+              y = value,
+              group = subgroup, #variable
+              color = subgroup))) +
+  theme_light() +
+  #geom_line() +
+  geom_smooth(method=loess, se=T) + #geom_text()
+  geom_text_repel(aes(label=ifelse(days_since_symptoms_onset ==  33,as.character(gene_name),'')),hjust=0.7,vjust=0, size=2.5) + #color="black", 
+  labs(title = paste0("Selected binders"),
+       subtitle = paste0(norm_info, ", ", cov_npx$data_set,
+                         "\n", samples_to_include, ", ", binders_to_include),
+       tag=format(Sys.time(),"%Y-%m-%d"),
+       caption="")
+
+dev.off()
+```
+
+
+```{r, warning=F}
+# Publication version
+
+# Proteins to be included, constant, increasing or decreasing with time
+const <-c("CPB1", "VWF", "ANGPTL1", "FCGR2A", "LILRB1", "CHIT1", "MBL2")
+incr <- c("CCL15", "ANG", "CHRDL2", "CRTAC1", "EPCAM", "LGALS3") #, "FETUB", "IGFBP3")
+decr <- c("GP1BA", "IL2RA", "PILRB", "CCL5", "IL18BP", "CHL1", "GNLY") #, "TGFBI", "CCL2", "IL1RL1")
+
+df_melt$subgroup <- NA
+df_melt$subgroup[df_melt$gene_name %in% const] <- "Constant"
+df_melt$subgroup[df_melt$gene_name %in% incr] <- "Increasing"
+df_melt$subgroup[df_melt$gene_name %in% decr] <- "Decreasing"
+
+# Constant proteins
+lineplt_const <- df_melt %>%
+  filter(subgroup == "Constant" & replicate == "mean_A_B") %>%
+  ggplot(aes(x = days_since_symptoms_onset,
+             y = value)) +
+  theme_classic() +
+  geom_smooth(colour = "black", method = loess, se = T, size = 1.5) +
+  labs(x = "Days since symptoms onset", y = "Z-score") +
+  ylim(-2.5, 2.5) +
+  annotate("text", x = 31, y = -1.3, fontface = "bold", size = 5.5,
+           label = paste(const, collapse = "\n"), colour = "black") +
+  geom_hline(yintercept = 0, size = 1, linetype = "dotted")
+
+# Non-constant proteins
+lineplt_nonconst <- df_melt %>%
+  filter(subgroup %in% c("Increasing", "Decreasing") & replicate == "mean_A_B") %>%
+  ggplot() +
+  theme_classic() +
+  geom_smooth(aes(x = days_since_symptoms_onset,
+                  y = value,
+                  group = subgroup,
+                  colour = subgroup),
+              method = loess, se = T, size = 1.5) +
+  labs(x = "Days since symptoms onset", y = "Z-score") +
+  annotate("text", x = 31, y = 1.7, fontface = "bold", size = 5.5,
+           label = paste(incr, collapse = "\n"), colour = scales::hue_pal()(2)[2]) +
+  annotate("text", x = 31, y = -0.3, fontface = "bold", size = 5.5,
+           label = paste(decr[1:2], collapse = "\n"), colour = scales::hue_pal()(2)[1]) +
+  annotate("text", x = 31, y = -1.75, fontface = "bold", size = 5.5,
+           label = paste(decr[3:length(decr)], collapse = "\n"), colour = scales::hue_pal()(2)[1]) +
+  theme(legend.position = "none") +
+  coord_cartesian(clip = "off") +
+  ylim(-2.5, 2.5) +
+  geom_hline(yintercept = 0, size = 1, linetype = "dotted")
+
+# IgG/IgM measurements of SPK/RBD/NCP antigens
+# MFI values of antigens of interest to use for analysis
+ag_mfi <- metadata %>%
+  filter(id != "other_person") %>%
+  select(id, which(str_detect(colnames(.), "SPK|RBD|NCP")))
+rownames(ag_mfi) <- make.names(ag_mfi$id)
+
+# The antigen data is of the character class and contains commas, remove those
+ag_mfi[, -1] <- apply(ag_mfi[, -1], 2, function(x) {
+  new_mfi <- gsub(",", "", x) 
+  class(new_mfi) <- "numeric"
+  return(new_mfi)
+}) %>% as.data.frame()
+
+ag_mfi_melt <- ag_mfi[, -1] %>%
+  as.data.frame() %>%
+  mutate(id = rownames(ag_mfi)) %>%
+  mutate(days_since_symptoms_onset = df[match(id, df$sample_id), "days_since_symptoms_onset"]) %>%
+  pivot_longer(cols = -c(id, days_since_symptoms_onset)) %>%
+  mutate(ig = str_extract(name, "IG(G|M){1}"))
+
+lineplt_ig <- ggplot(ag_mfi_melt, aes(x = days_since_symptoms_onset, y = value, group = ig, linetype = ig)) +
+  geom_smooth(method = loess, se = T, size = 1.5, colour = "black") +
+  labs(x = "Days since symptoms onset", y = "MFI [AU]") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  scale_y_log10() +
+  annotate("text", x = 32, y = 7500, fontface = "bold", size = 7,
+           label = "IgG", colour = "black") +
+  annotate("text", x = 32, y = 700, fontface = "bold", size = 7,
+           label = "IgM", colour = "black")
+
+# Combine
+lineplt_combine <- lineplt_const + lineplt_nonconst + lineplt_ig + plot_annotation(tag_levels = "A") &
+  theme(axis.title = element_text(size = 22),
+        axis.text = element_text(size = 20),
+        plot.tag = element_text(size = 30),
+        axis.line = element_line(size = 1))
+
+ggsave(paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+					 "_longitudinal_selected_lineplots_panels.pdf"),
+       plot = lineplt_combine, width = 24, height = 8)
+```
+
+
+***
+# Z-scoring and linear models
+```{r calc, eval=t, results='hide'}
+
+# use transformed data, z-scores
+# use average value
+
+df <- z_score_mean %>% t()
+days_since_onset <- pat$days_since_symptoms_onset[match(colnames(df), pat$unique_participant_ID)]
+
+
+lm_fit <- sapply(selected_binders, function(i) lm(df[i,] ~ days_since_onset), simplify= F)
+intercept <- sapply(names(lm_fit), function(i) coef(summary(lm_fit[[i]]))[1,1])
+slope <- sapply(names(lm_fit), function(i) coef(summary(lm_fit[[i]]))[2,1])
+
+sum_residuals <- sapply(names(lm_fit), function(i)
+  lm_fit[[i]] %>%
+    residuals() %>%
+    abs() %>%
+    sum())
+
+r_squared <- sapply(names(lm_fit), function(i) summary(lm_fit[[i]])$r.squared) %>%
+  round(3)
+
+#plot(df["SPON1.CVD3",])
+
+lm_summary <-
+  tibble(names(lm_fit), intercept, slope, sum_residuals, r_squared) %>%
+  rename("unique_id" = "names(lm_fit)")
+
+# calculate standard deviation for 1) intercept, 2) slope, 3) sum of residuals
+  # if individuals is mean+/-cut-off(e.g. 3)xSD, set score = 1, otherwise score=0
+  sd_cut_off <- 2
+
+  cut_off_1 <- sapply(c("intercept", "slope", "sum_residuals"),
+         function(x) mean(lm_summary[x] %>% unlist()) + sd(lm_summary[x] %>% unlist())*sd_cut_off)
+
+   cut_off_2 <- sapply(c("intercept", "slope", "sum_residuals"),
+         function(x) mean(lm_summary[x] %>% unlist) - sd(lm_summary[x] %>% unlist())*sd_cut_off)
+
+
+lm_summary <-
+  lm_summary %>%
+add_column(intercept_score = 0,
+                 slope_score = 0,
+                 sum_residuals_score = 0) %>%
+    transform(intercept_score = ifelse(intercept >= cut_off_1["intercept"] | intercept <= cut_off_2["intercept"], 1, intercept_score)) %>%
+     transform(slope_score = ifelse(slope >= cut_off_1["slope"] | slope <= cut_off_2["slope"], 1, slope_score)) %>%
+     transform(sum_residuals_score = ifelse(sum_residuals >= cut_off_1["sum_residuals"] | sum_residuals <= cut_off_2["sum_residuals"], 1, sum_residuals_score))
+
+
+```
+
+***
+# Table of results
+```{r fig.align='center', warning=F}
+
+lm_summary %>%
+  mutate(intercept = round(intercept, 3),
+         slope = round(slope, 3),
+         sum_residuals = round(sum_residuals, 3)) %>%
+  select(-ends_with("score") ) %>%
+  datatable(caption = "Longitudinal diversity, linear regression model output",
+            rownames=F,
+            options = list(columnDefs = list(list(className = 'dt-center', targets = "_all"))
+                           ))
+
+lm_summary %>%
+  select(unique_id,
+         intercept_score,
+         slope_score,
+         sum_residuals_score) %>%
+  mutate(sum = apply(lm_summary[,c("intercept_score", "slope_score", "sum_residuals_score")], 1, sum)) %>%
+  datatable(caption = "Longitudinal diversity, linear regression model output",
+            rownames=F,
+            options = list(columnDefs = list(list(className = 'dt-center', targets = "_all"))
+                           ))
+
+```
+
+***
+## Output excel
+```{r warning=F}
+
+# add uniprot ids to output list
+uni_id <- left_join(uni_id %>% distinct(), prot[, c("assay", "unique_id", "panel_name")])
+
+lm_summary %>% 
+  right_join(uni_id, by="unique_id") %>% 
+  mutate(intercept = round(intercept, 3),
+         slope = round(slope, 3),
+         sum_residuals = round(sum_residuals, 3)) %>%
+  select(-ends_with("score") ) %>%
+  select(assay, uniprot_ID, panel_name, everything(), -unique_id, -gene_name) %>% 
+  write_xlsx(path=paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"), "_lm_model_per_protein.xlsx"))
+
+```
+
+
+
+***
+# SOTA clustering
+## SOTA plots
+Aim is to test and find with 3, 6, or 9 clusters.
+Here, z-scored data, mean of A and B, selected binders.
+```{r fig.align='center', warning=F, fig.dim = c(10,7)}
+
+cluster_n <- c(4, 5, 6, 9)
+
+sotaCl_results <- list()
+
+# N.B "gene" = number of proteins
+
+for(i in c(cluster_n)-1){ #sota will use i+1
+
+  sotaCl_results[[i+1]] <- sota(t(z_score_mean[, selected_cor_binders]),i)
+  plot(sotaCl_results[[i+1]],
+       main=paste0("SOTA clust n = ",i+1, "\n", norm_info))
+}
+
+```
+
+## Selected SOTA plot for export
+Select SOTA plot, make clean version and save to pdf
+```{r warning=F, echo=F}
+
+# Make clean ggplot of SOTA results
+# sotaCl_results[[i+1]]$data # values of each unique protein profile
+# sotaCl_results[[i+1]]$clust # which cluster each protein belongs to
+# 
+# sotaCl_results[[i+1]]$tree # average value in red for each cluster
+# sotaCl_results[[i+1]]$totals # how many proteins there are per cluster ("genes" in SOTA plot)
+# 
+
+# select i
+pick_clust = 9
+  
+plot_gg_sota <- data.frame("cluster"= sotaCl_results[[pick_clust]]$clust, sotaCl_results[[pick_clust]]$data)
+# add values for red line
+red_avg <- sotaCl_results[[pick_clust]]$tree[, -c(2:3)]
+colnames(red_avg)[colnames(red_avg) %in% "ID"] <- "cluster"
+plot_gg_sota <- rbind(plot_gg_sota, red_avg)
+
+plot_gg_sota$unique_id <- rownames(plot_gg_sota)
+plot_gg_sota$unique_id[plot_gg_sota$unique_id %in% c(1:9)] <- c("w_avg_line")
+
+
+s_test <- 
+  plot_gg_sota %>% 
+  melt(c("cluster", "unique_id"))
+
+# set names for headers
+for(j in unique(s_test$cluster)){
+  
+  s_test$cluster[s_test$cluster %in% j] <- 
+    paste0("cluster ", j, ", n=", sotaCl_results[[i+1]]$totals[j])
+}
+
+
+s_test$col_group <- "gray80"
+s_test$col_group[s_test$unique_id %in% "w_avg_line"] <- "red"
+
+s_test$days <- metadata[match(s_test$variable, metadata$unique_participant_ID), "Comment"]
+
+pdf(paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+					 "_selected_sota_n_",pick_clust,"_clusters_discrX.pdf"),
+		width = 7, height = 7, useDingbats=F, onefile=T)
+
+ggplot(s_test,
+       aes(x=variable, y=value, group=unique_id, color=col_group)) +
+  #geom_point(alpha=.7) +
+  geom_line(alpha=.7, size = 1) +
+  scale_x_discrete(labels=as.character(metadata$Comment[2:6])) +
+  xlab("Days since symptoms onset") +
+  ylab("Z-score") +
+  theme_classic() +
+  theme(axis.line = element_line(size = 1),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        strip.text = element_text(size = 14)) +
+  scale_color_identity() +
+  facet_wrap(~ cluster, ncol = 3)
+
+dev.off()
+
+pdf(paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"),
+					 "_selected_sota_n_",pick_clust,"_clusters_contX.pdf"),
+		width = 7, height = 7, useDingbats=F, onefile=T)
+
+ggplot(s_test,
+       aes(x=days, y=value, group=unique_id, color=col_group)) +
+  #geom_point(alpha=.7) +
+  geom_line(alpha=.7, size = 1) +
+  xlab("Days since symptoms onset") +
+  ylab("Z-score") +
+  theme_classic() +
+  theme(axis.line = element_line(size = 1),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        strip.text = element_text(size = 14)) +
+  scale_color_identity() +
+  facet_wrap(~ cluster, ncol = 3)
+
+dev.off()
+
+```
+
+***
+## SOTA table output
+```{r eval=t,  warning=F}
+
+# # select cluster
+# select_cluster_n <- 6
+# 
+# # extract which proteins belong to each cluster
+# #identical(rownames(sotaCl_results[[9]][1]$data), prot$unique_id)
+
+prot_sota <- prot[prot$unique_id %in% selected_cor_binders,]
+
+#prot_sota$sota_cluster <- sotaCl_results[[select_cluster_n]][4]$clust
+
+prot_sota <- cbind(prot_sota, 
+          sapply(cluster_n, function(x) sotaCl_results[[x]][4]$clust))
+
+colnames(prot_sota)[c(length(colnames(prot_sota))-length(cluster_n)+1):length(colnames(prot_sota))] <- paste0("sota_cluster_", cluster_n)
+
+prot_sota %>%
+  select(unique_id, assay, panel_name, starts_with("sota_cluster")) %>%
+  datatable(caption = "SOTA clustering",
+            rownames=F,
+            options = list(columnDefs = list(list(className = 'dt-center', targets = "_all"))
+                           ))
+
+# # output SOTA clusters
+prot_sota %>%
+  select(unique_id, assay, uniprot_ID, panel_name, gene_name, starts_with("sota_cluster")) %>%
+  arrange(unique_id) %>% 
+  #arrange(sota_cluster) %>%
+  write_xlsx(path=paste0(out_dir, format(Sys.time(),"%Y-%m-%d_%H%M%S"), "_sota_clusters_gene_names.xlsx"))
+
+```
+
+
+***
+# Session information
+```{r session_info, eval=T, echo=F}
+sessionInfo()
+
+```

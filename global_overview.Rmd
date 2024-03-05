@@ -1,0 +1,220 @@
+---
+title: "Global overview of the three datasets"
+author: "Leo Dahl"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = F)
+```
+
+# Description
+
+> Provides a global overview of the datasets with PCA, UMAP, and median vs IQR plots. The last plot also classifies outliers by marking samples that fall outside of mean + 3SD thresholds of median NPX or IQR.
+
+# Packages and data
+
+```{r packages, message=F, warning=F}
+
+rm(list = ls())
+options(stringsAsFactors = F)
+library(tidyverse)
+library(ggrepel)
+library(ggh4x)
+library(umap)
+library(patchwork)
+
+```
+
+```{r load data}
+
+source("load_cov_npx.R")
+cov_npx <- load_cov_npx("abspqn_excl")
+
+out_dir <- "../results/global_overview/"
+```
+
+Loaded data set **`r cov_npx$data_set`**  
+from **`r cov_npx$data_path`**, with the following treatment:  
+`r cov_npx$norm`
+
+
+```{r}
+
+npx <- cov_npx$npx
+sinfo <- cov_npx$sinfo
+binder <- cov_npx$binder
+
+# Turn into character to not get unexpected behaviour from factor
+sinfo$grp <- as.character(sinfo$grp)
+
+# Separate datasets, use complete samples
+sinfo_umap <- cov_npx$sinfo %>% filter(Analysis_date == "2020-06-23", !grp %in% c("Neg Ctrl", "IPC"))
+npx_umap <- cov_npx$npx[sinfo_umap$sample_id, ]
+npx_umap <- npx_umap[complete.cases(npx_umap), ]
+sinfo_umap <- sinfo_umap %>% filter(sample_id %in% rownames(npx_umap)) %>%
+  # Update serostatus names
+  mutate(serostatus = case_when(serostatus == "no reactivity" ~ "Seronegative, IgM-IgG-",
+                                serostatus == "IgG + IgM" ~ "Seropositive, IgM+IgG+"))
+
+sinfo_spk <- cov_npx$sinfo %>% filter(Analysis_date == "2020-11-13", !grp %in% c("Neg Ctrl", "IPC"), !str_detect(Analysis_group, "UMAP"))
+npx_spk <- cov_npx$npx[sinfo_spk$sample_id, ]
+npx_spk <- npx_spk[complete.cases(npx_spk), ]
+sinfo_spk <- sinfo_spk %>% filter(sample_id %in% rownames(npx_spk)) %>%
+  # Update serostatus names
+  mutate(serostatus = case_when(serostatus == "IgG" ~ "Late phase, IgM-Ig+",
+                                serostatus == "IgM" ~ "Early phase, IgM+IgG-"))
+
+```
+
+Also get dataset 3
+
+```{r}
+
+ds3 <- load_cov_npx(paste0("ds3_", cov_npx$data_set))
+sinfo_ds3 <- ds3$sinfo %>% rename(serostatus = grp) # %>% filter(both_pos | !any_pos)
+npx_ds3 <- ds3$npx %>% filter(sample_id %in% sinfo_ds3$sample_id)
+sinfo_ds3 <- sinfo_ds3 %>% filter(sample_id %in% npx_ds3$sample_id) %>%
+  # Update serostatus names
+  mutate(serostatus = case_when(serostatus == "Negative" ~ "Seronegative, IgG-",
+                                serostatus == "Positive" ~ "Seropositive, IgG+"))
+binder_ds3 <- ds3$binfo
+
+```
+
+Loaded data set **`r ds3$data_set`** from **`r ds3$data_path`**
+
+Load the median vs IQR outlier plots.
+
+```{r}
+outl_plts <- readRDS(paste0(out_dir, "../../data_dir/outliers_plt_obj_abspqn.rds"))
+```
+
+
+# Generate plots
+
+```{r}
+# Make plots per dataset
+plts <- lapply(list(
+  "Dataset1" = list("npx" = npx_umap, "sinfo" = sinfo_umap, "binder" = binder %>% rename(panel_long = panel, panel = panel_name), "name" = "Dataset1"),
+  "Dataset2" = list("npx" = npx_spk, "sinfo" = sinfo_spk, "binder" = binder %>% rename(panel_long = panel, panel = panel_name), "name" = "Dataset2"),
+  "Dataset3" = list("npx" = npx_ds3 %>% column_to_rownames("sample_id"),
+                    "sinfo" = sinfo_ds3[match(npx_ds3$sample_id, sinfo_ds3$sample_id), ],
+                    "binder" = binder_ds3 %>% rename(unique_id = assay),
+                    "name" = "Dataset3")
+), function(x) {
+  
+  # Make long data
+  plt_dat <- x$npx %>% as.data.frame() %>% rownames_to_column("sample_id") %>%
+    pivot_longer(cols = -sample_id, names_to = "unique_id", values_to = "npx") %>%
+    left_join(x$binder %>% select(unique_id, panel), by = "unique_id") %>%
+    left_join(x$sinfo %>% select(sample_id, serostatus), by = "sample_id") %>%
+    mutate(serostatus = as.character(serostatus))
+  
+  # Choose different colours based on which dataset it is
+  dat_col <- RColorBrewer::brewer.pal(6, "Set2")
+  dat_col <- switch(x$name, "Dataset1" = dat_col[1:2], "Dataset2" = dat_col[3:4], "Dataset3" = dat_col[6:5]) %>%
+    setNames(unique(plt_dat$serostatus))
+  
+  # Same point size for all
+  point_size <- 3
+  
+  # PCA
+  pca_plt <- plt_dat %>%
+    # Perform per panel. To include variance explained in axes, make a plot per panel by nesting (dplyr) instead of facetting (ggplot)
+    group_by(panel) %>% nest() %>%
+    mutate(pca_plt = map(data, ~ {
+      p <- .x %>% pivot_wider(id_cols = sample_id, names_from = "unique_id", values_from = "npx") %>%
+        column_to_rownames("sample_id") %>%
+        prcomp(., center = T, scale. = T) %>% summary()
+      
+      plt_dat <- data.frame(pc1 = p$x[, 1], pc2 = p$x[, 2],
+                        sample_id = rownames(p$x), panel = panel) %>%
+        # Add serostatus
+        left_join(.x %>% select(sample_id, serostatus) %>% distinct(), by = "sample_id")
+      
+      # Data for drawing lines
+      line_df <- plt_dat %>% filter(str_detect(sample_id, "_[:alpha:]$")) %>%
+        mutate(line_id = str_remove(sample_id, "_[:alpha:]$")) %>%
+        select(line_id, pc1, pc2)
+      
+        # Add serostatus
+      plt<- ggplot(plt_dat, aes(x = pc1, y = pc2, colour = serostatus)) +
+        geom_line(aes(group = line_id), colour = "grey", data = line_df) +
+        geom_point(size = point_size) +
+        labs(x = paste0("PC1 (", signif(p$importance[2, 1] * 100, 2), "% variance explained)"),
+             y = paste0("PC2 (", signif(p$importance[2, 2] * 100, 2), "% variance explained)"),
+             colour = "Serostatus") +
+        scale_colour_manual(values = dat_col) +
+        facet_wrap(~ panel) +
+        theme_classic()
+    })) %>%
+    pull(pca_plt)
+  
+  # UMAP
+  umap_plt <- plt_dat %>%
+    # Perform per panel
+    group_by(panel) %>% nest() %>%
+    mutate(umap_plt = map(data, ~ {
+      u <- .x %>% pivot_wider(id_cols = sample_id, names_from = "unique_id", values_from = "npx") %>%
+        column_to_rownames("sample_id") %>%
+        umap()
+      
+      plt_dat <- data.frame(UMAP1 = u$layout[, 1], UMAP2 = u$layout[, 2],
+                        sample_id = rownames(u$layout), panel = panel) %>%
+        # Add serostatus
+        left_join(.x %>% select(sample_id, serostatus) %>% distinct(), by = "sample_id")
+      
+      # Data for drawing lines
+      line_df <- plt_dat %>% filter(str_detect(sample_id, "_[:alpha:]$")) %>%
+        mutate(line_id = str_remove(sample_id, "_[:alpha:]$")) %>%
+        select(line_id, UMAP1, UMAP2)
+      
+      plt <- ggplot(plt_dat, aes(x = UMAP1, y = UMAP2, colour = serostatus)) +
+        geom_line(aes(group = line_id), colour = "grey", data = line_df) +
+        geom_point(size = point_size) +
+        scale_colour_manual(values = dat_col) +
+        labs(colour = "Serostatus") +
+        facet_wrap(~ panel) +
+        theme_classic()
+    })) %>%
+    pull(umap_plt)
+  return(list("pca_plt" = pca_plt,
+              "umap_plt" = umap_plt,
+              "dataset" = x$name))
+})
+
+```
+
+```{r}
+# Wrap together plots
+wrp_plts <- lapply(1:3, function(x) {
+  wrap_plots(c(plts[[x]]$pca_plt, plts[[x]]$umap_plt, outl_plts[[x]]),
+             guides = "collect", nrow = 3, ncol = 3) +
+    plot_annotation(title = plts[[x]]$dataset, theme = theme(plot.title = element_text(hjust = 0.5, size = 14)))
+})
+```
+
+Combined PCA, UMAP, and median vs IQR plots (without labels) are saved as PDF files.
+
+```{r}
+# Save plots
+for (i in seq_along(wrp_plts)) {
+  ggsave(filename = paste0(out_dir, format(Sys.time(), "%Y-%m-%d_%H%M%S"), "_overview_plots_", cov_npx$data_set, "_", i, ".pdf"),
+         plot = wrp_plts[[i]],
+         width = 11, height = 10)
+}
+
+```
+
+
+# Session information
+
+```{r session information}
+sessionInfo()
+```

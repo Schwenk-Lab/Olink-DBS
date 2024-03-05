@@ -1,0 +1,255 @@
+---
+title: "Outliers (median vs IQR)"
+author: "Leo Dahl"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = F)
+```
+
+# Description
+
+> Looking for outliers in olink dbs data. Base outlier search on Olink QC plots, where outliers are those that have a median IQR larger than the mean IQR + 3 * sd(IQR), or median NPX larger than the mean of median NPXs + 3 sd(NPX). 
+
+# Packages and data
+
+```{r packages, message=F, warning=F}
+
+rm(list = ls())
+options(stringsAsFactors = F)
+library(tidyverse)
+library(ggrepel)
+library(ggh4x)
+library(patchwork)
+
+```
+
+***
+
+Data preparation
+================
+
+Load files
+----------
+
+```{r load data}
+source("load_cov_npx.R")
+
+cov_npx <- load_cov_npx("abspqn")
+```
+
+Loaded data set **`r cov_npx$data_set`**  
+from **`r cov_npx$data_path`**, with the following treatment:  
+`r cov_npx$norm`
+
+```{r}
+
+# Separate datasets 1 and 2 while keeping replicates
+npx <- cov_npx$npx
+sinfo <- cov_npx$sinfo
+binder <- cov_npx$binder
+
+# Turn into character to not get unexpected behaviour from factor
+sinfo$grp <- as.character(sinfo$grp)
+
+# Separate datasets, use complete samples
+sinfo_umap <- cov_npx$sinfo %>% filter(Analysis_date == "2020-06-23", !grp %in% c("Neg Ctrl", "IPC"))
+npx_umap <- cov_npx$npx[sinfo_umap$sample_id, ]
+npx_umap <- npx_umap[complete.cases(npx_umap), ]
+sinfo_umap <- sinfo_umap %>% filter(sample_id %in% rownames(npx_umap)) %>%
+  # Update serostatus names
+  mutate(serostatus = case_when(serostatus == "no reactivity" ~ "Seronegative, IgM-IgG-",
+                                serostatus == "IgG + IgM" ~ "Seropositive, IgM+IgG+"))
+
+sinfo_spk <- cov_npx$sinfo %>% filter(Analysis_date == "2020-11-13", !grp %in% c("Neg Ctrl", "IPC"), !str_detect(Analysis_group, "UMAP"))
+npx_spk <- cov_npx$npx[sinfo_spk$sample_id, ]
+npx_spk <- npx_spk[complete.cases(npx_spk), ]
+sinfo_spk <- sinfo_spk %>% filter(sample_id %in% rownames(npx_spk)) %>%
+  # Update serostatus names
+  mutate(serostatus = case_when(serostatus == "IgG" ~ "Late phase, IgM-Ig+",
+                                serostatus == "IgM" ~ "Early phase, IgM+IgG-"))
+
+```
+
+Also get dataset 3
+
+```{r}
+
+ds3 <- load_cov_npx("ds3_abspqn")
+
+sinfo_ds3 <- ds3$sinfo %>% rename(serostatus = grp) # %>% filter(both_pos | !any_pos)
+npx_ds3 <- ds3$npx %>% filter(sample_id %in% sinfo_ds3$sample_id)
+sinfo_ds3 <- sinfo_ds3 %>% filter(sample_id %in% npx_ds3$sample_id) %>%
+  # Update serostatus names
+  mutate(serostatus = case_when(serostatus == "Negative" ~ "Seronegative, IgG-",
+                                serostatus == "Positive" ~ "Seropositive, IgG+"))
+binder_ds3 <- ds3$binfo
+
+```
+
+Loaded data set **`r ds3$data_set`** from **`r ds3$data_path`**
+
+***
+
+# Plotting outliers
+
+```{r}
+# Function for median vs iqr plot
+med_iqr_plt <- function(npx_in, col_vec = NULL, pt_size = 2, lab_outl = T) {
+  # Compute medians and IQRs of samples, per protein panel
+  iqr_median_dat <- npx_in %>%
+    group_by(sample_id, panel) %>%
+    summarise(iqr = IQR(npx), median = median(npx), serostatus = unique(serostatus), .groups = "keep") %>%
+    ungroup()
+  
+  # Thresholds for outliers
+  iqr_median_thr <- iqr_median_dat %>%
+    group_by(panel) %>%
+    summarise(upper_iqr = mean(iqr) + 3 * sd(iqr),
+              lower_iqr = mean(iqr) - 3 * sd(iqr),
+              upper_median = mean(median) + 3 * sd(median),
+              lower_median = mean(median) - 3 * sd(median),
+              uiqr5 = mean(iqr) + 5 * sd(iqr),
+              liqr5 = mean(iqr) - 5 * sd(iqr),
+              umedian5 = mean(median) + 5 * sd(median),
+              lmedian5 = mean(median) - 5 * sd(median),
+              .groups = "keep")
+  
+  # Add column saying whether a sample is an outlier or not
+  iqr_median_dat <- left_join(iqr_median_dat, iqr_median_thr, by = c("panel")) %>%
+    mutate(outlier = case_when(iqr > upper_iqr | iqr < lower_iqr | median > upper_median | median < lower_median ~ "outlier"))
+  
+  # Turn thresholds table into long format for plotting
+  iqr_median_thr <- pivot_longer(iqr_median_thr, -c(panel), names_to = "threshold", values_to = "value") %>%
+    mutate(lty = case_when(str_detect(threshold, "5") ~ "5SD", T ~ "3SD"))
+  
+  # Make plot, nest by protein panel to keep same style as the other plots
+  med_iqr_plt <- iqr_median_dat %>% group_by(panel) %>% nest() %>%
+    mutate(plt = map(data, ~ {
+      # Get panel name to avoid conflicts arising from using the same name on variables
+      cur_panel <- panel
+      
+      # Make data frame for samples to draw lines between
+      replicate_ids <- .x %>%
+        filter(str_detect(sample_id, "_[:alpha:]$")) %>%
+        mutate(sample_id = str_remove(sample_id, "_[:alpha:]$")) %>%
+        pull(sample_id)
+      
+      # Deal with case of no replicates
+      if (length(replicate_ids) > 0) {
+        line_df <- .x %>%
+        filter(str_detect(sample_id, paste0(replicate_ids, collapse = "|"))) %>%
+        mutate(line_id = str_remove(sample_id, "_[:alpha:]$"))
+      } else {
+        line_df <- .x %>% mutate(line_id = "") %>% slice(0)
+      }
+      
+      thr_df <- iqr_median_thr %>% filter(panel == cur_panel)
+      
+      p <- .x %>% mutate(panel = cur_panel) %>%
+        ggplot(aes(x = median, y = iqr)) +
+        geom_line(aes(group = line_id), colour = "grey", data = line_df) +
+        geom_point(aes(colour = serostatus), size = pt_size) +
+        geom_hline(aes(yintercept = value, linetype = lty), data = thr_df %>% filter(str_detect(threshold, "iqr")), colour = "grey75") +
+        geom_vline(aes(xintercept = value, linetype = lty), data = thr_df %>% filter(str_detect(threshold, "median")), colour = "grey75") +
+        geom_smooth(data = .x %>% filter(is.na(outlier)), formula = y ~ x, method = "lm", alpha = 0.3) +
+        scale_linetype_manual(values = c("5SD" = "dotted", "3SD" = "dashed")) +
+        labs(linetype = NULL, x = "Median", y = "IQR", colour = "Serostatus") +
+        facet_wrap(~ panel) +
+        theme_classic()
+      
+      # Use specified colours, if specified
+      if (!is.null(col_vec)) {p <- p + scale_colour_manual(values = col_vec)}
+      # Label outliers
+      if (lab_outl) {p <- p + geom_text_repel(aes(label = sample_id), data = .x %>% filter(outlier == "outlier"), size = 3)}
+      
+      return(p)
+    })) %>%
+    pull(plt)
+  
+  return(list("plots" = med_iqr_plt, "data" = iqr_median_dat))
+}
+```
+
+
+```{r}
+# Put all NPX values in one dataframe, add panel info
+npx_in <- rbind(
+  # Dataset1
+  npx_umap %>% as.data.frame() %>% rownames_to_column("sample_id") %>%
+    pivot_longer(cols = -sample_id, names_to = "assay", values_to = "npx") %>%
+    mutate(dataset = "Dataset1") %>%
+    left_join(binder %>% select(unique_id, panel_name), by = c("assay" = "unique_id")) %>%
+    left_join(sinfo_umap %>% select(sample_id, serostatus), by = "sample_id") %>%
+    mutate(serostatus = as.character(serostatus)) %>%
+    rename(panel = panel_name),
+  # Dataset2
+  npx_spk %>% as.data.frame() %>% rownames_to_column("sample_id") %>%
+    pivot_longer(cols = -sample_id, names_to = "assay", values_to = "npx") %>%
+    mutate(dataset = "Dataset2") %>%
+    left_join(binder %>% select(unique_id, panel_name), by = c("assay" = "unique_id")) %>%
+    left_join(sinfo_spk %>% select(sample_id, serostatus), by = "sample_id") %>%
+    mutate(serostatus = as.character(serostatus)) %>%
+    rename(panel = panel_name),
+  # Dataset3
+  npx_ds3 %>%
+    pivot_longer(cols = -sample_id, names_to = "assay", values_to = "npx") %>%
+    mutate(dataset = "Dataset3") %>%
+    left_join(ds3$binfo %>% select(assay, panel), by = c("assay")) %>%
+    left_join(sinfo_ds3 %>% select(sample_id, serostatus), by = "sample_id") %>%
+    mutate(serostatus = as.character(serostatus))
+)
+
+# Outlier plots (median and IQR)
+med_iqr_plots <- npx_in %>% group_by(dataset) %>% nest() %>%
+  mutate(plt = map(data, ~ {
+    # Choose different colours based on which dataset it is
+    dat_col <- RColorBrewer::brewer.pal(6, "Set2")
+    dat_col <- switch(dataset, "Dataset1" = dat_col[1:2], "Dataset2" = dat_col[3:4], "Dataset3" = dat_col[6:5]) %>%
+      setNames(unique(.x$serostatus))
+    
+    w_labels <- med_iqr_plt(.x, dat_col, 3)
+    wo_labels <- med_iqr_plt(.x, dat_col, 3, F)
+    return(list("data" = w_labels$data %>% mutate(dataset = dataset), "plt_lab" = w_labels$plots, "plt_nolab" = wo_labels$plots))
+  })) %>%
+  pull(plt)
+
+```
+
+```{r, fig.width=16, fig.height=5}
+lapply(med_iqr_plots, function(x) wrap_plots(x$plt_lab, nrow = 1, guides = "collect"))
+```
+
+# Save data and plots
+
+```{r}
+dat_fn <- str_split(cov_npx$data_path, "\\/") %>% unlist()
+dat_fn <- paste0(dat_fn[-length(dat_fn)], collapse = "/")
+dat_fn <- paste0(dat_fn, "/outliers_", cov_npx$data_set, ".rds")
+dat_save <- lapply(med_iqr_plots, function(x) x$data) %>% data.table::rbindlist() %>% as.data.frame()
+saveRDS(object = dat_save, file = dat_fn)
+```
+
+Save plotting data in the file **`r dat_fn`** to load for outlier removal.
+
+```{r}
+# Save plot objects
+plt_fn <- str_split(cov_npx$data_path, "\\/") %>% unlist()
+plt_fn <- paste0(plt_fn[-length(plt_fn)], collapse = "/")
+plt_fn <- paste0(plt_fn, "/outliers_plt_obj_", cov_npx$data_set, ".rds")
+plt_save <- lapply(med_iqr_plots, function(x) x$plt_nolab)
+saveRDS(object = plt_save, file = plt_fn)
+```
+
+
+# Session information
+
+```{r session information}
+sessionInfo()
+```
