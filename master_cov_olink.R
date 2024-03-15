@@ -66,6 +66,9 @@ render(input = "global_overview.Rmd",
                             format(Sys.time(), "%Y-%m-%d_%H%M%S"),
                             "_global_overview.html"))
 
+# Plasma vs DBS analysis
+source("plasma_vs_dbs.R")
+
 ####### Association tests #######
 
 # Lasso regression
